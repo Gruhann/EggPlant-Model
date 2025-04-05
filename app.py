@@ -91,35 +91,52 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
     
     return img, ratio, (dw, dh)
 
-def process_output(output_data, input_shape, original_shape, confidence_threshold=0.3):
+def process_output(output_data, input_shape, original_shape, confidence_threshold=0.1):
     """Process YOLOv8 TFLite output and get the highest confidence detection and its class"""
-    print("Processing output shape:", output_data.shape)
-    output = output_data[0]  # First output is typically the detection data
-    
-    # YOLOv8 output shape is [batch, boxes, 85] 
-    # where 85 = 4 (box coords) + 1 (objectness) + 80 (class scores)
-    # or in some exported models it's [batch, boxes, 4+1+num_classes]
-    
-    num_boxes = output.shape[0]
-    print(f"Number of detections: {num_boxes}")
-    box_data = []
-    max_confidence = 0
-    predicted_class = None
-    has_eggplant = False
-    
-    for i in range(num_boxes):
-        confidence = output[i][4]  # Objectness score
-        if confidence > confidence_threshold:
-            has_eggplant = True
-            class_id = np.argmax(output[i][5:])
-            class_score = output[i][5 + class_id]
-            total_confidence = float(confidence * class_score)
+    try:
+        # Print debug information
+        print("Output data shape:", output_data.shape)
+        
+        # Get the first batch of predictions
+        output = output_data[0]
+        
+        # Print the shape of processed output
+        print("Processed output shape:", output.shape)
+        
+        num_boxes = output.shape[0]
+        max_confidence = 0
+        predicted_class = None
+        has_eggplant = False
+        
+        # Process each detection
+        for i in range(num_boxes):
+            # Get objectness score (confidence that this is an object)
+            confidence = float(output[i][4])
+            print(f"Detection {i} confidence: {confidence}")
             
-            if total_confidence > max_confidence:
-                max_confidence = total_confidence
-                predicted_class = quality_class_names[class_id] if class_id < len(quality_class_names) else f"unknown"
-    
-    return has_eggplant, predicted_class, max_confidence
+            if confidence > confidence_threshold:
+                # Get class scores (starting from index 5)
+                class_scores = output[i][5:8]  # Only take the first 3 scores for our classes
+                class_id = int(np.argmax(class_scores))
+                class_score = float(class_scores[class_id])
+                
+                # Calculate total confidence
+                total_confidence = confidence * class_score
+                print(f"Detection {i} class_id: {class_id}, class_score: {class_score}, total_confidence: {total_confidence}")
+                
+                # Update if this is the highest confidence detection
+                if total_confidence > max_confidence:
+                    max_confidence = total_confidence
+                    predicted_class = quality_class_names[class_id]
+                    has_eggplant = True
+                    print(f"New best detection: class={predicted_class}, confidence={total_confidence}")
+        
+        print(f"Final result: has_eggplant={has_eggplant}, class={predicted_class}, confidence={max_confidence}")
+        return has_eggplant, predicted_class, max_confidence
+        
+    except Exception as e:
+        print(f"Error in process_output: {str(e)}")
+        return False, None, 0.0
 
 def predict_quality(img):
     global interpreter
@@ -127,51 +144,61 @@ def predict_quality(img):
     if interpreter is None:
         return False, "error", 0.0, "Model not loaded"
     
-    # Get model details
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-    
-    # YOLOv8 expects RGB images, convert if needed
-    if len(img.shape) == 3 and img.shape[2] == 3:
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    else:
-        img_rgb = img
-    
-    # Get input shape
-    input_shape = input_details[0]['shape'][1:3]  # [height, width]
-    
-    # Preprocess image using YOLOv8 letterbox function
-    preprocessed_img, ratio, padding = letterbox(img_rgb, input_shape)
-    
-    # Normalize and prepare input
-    input_data = preprocessed_img.astype(np.float32) / 255.0
-    input_data = np.expand_dims(input_data, axis=0)
-    
-    print("Input shape:", input_data.shape)
-    print("Input value range:", input_data.min(), "to", input_data.max())
-    
-    # Set the input tensor and run inference
-    interpreter.set_tensor(input_details[0]['index'], input_data)
-    interpreter.invoke()
-    
-    # Get the output tensor
-    output_data = interpreter.get_tensor(output_details[0]['index'])
-    print("Model output shape:", output_data.shape)
-    print("First few values:", output_data[0, :5])  # Print first 5 values
-    
-    # Process results
-    original_shape = img.shape[:2]
-    has_eggplant, predicted_class, confidence = process_output(
-        output_data, input_shape, original_shape, CONFIDENCE_THRESHOLD
-    )
-    
-    if not has_eggplant:
-        return False, None, 0.0, "No eggplant detected in the image"
-    
-    if predicted_class is None:
-        return True, None, 0.0, "Eggplant detected but quality classification failed"
-    
-    return True, predicted_class, confidence, "Success"
+    try:
+        # Get model details
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        # Print model details for debugging
+        print("Input details:", input_details)
+        print("Output details:", output_details)
+        
+        # Convert to RGB if needed
+        if len(img.shape) == 3 and img.shape[2] == 3:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            img_rgb = img
+        
+        # Get input shape from model
+        input_shape = input_details[0]['shape'][1:3]
+        print(f"Required input shape: {input_shape}")
+        
+        # Preprocess image
+        preprocessed_img, ratio, padding = letterbox(img_rgb, input_shape)
+        print(f"Preprocessed image shape: {preprocessed_img.shape}")
+        
+        # Normalize to [0, 1]
+        input_data = preprocessed_img.astype(np.float32) / 255.0
+        input_data = np.expand_dims(input_data, axis=0)
+        
+        # Print input stats
+        print(f"Input shape: {input_data.shape}")
+        print(f"Input range: {input_data.min()} to {input_data.max()}")
+        
+        # Run inference
+        interpreter.set_tensor(input_details[0]['index'], input_data)
+        interpreter.invoke()
+        
+        # Get output
+        output_data = interpreter.get_tensor(output_details[0]['index'])
+        print(f"Raw output shape: {output_data.shape}")
+        
+        # Process results
+        has_eggplant, predicted_class, confidence = process_output(
+            output_data, input_shape, img.shape[:2], CONFIDENCE_THRESHOLD
+        )
+        
+        if not has_eggplant:
+            return False, None, 0.0, "No eggplant detected in the image"
+        
+        if predicted_class is None:
+            return True, None, 0.0, "Eggplant detected but quality classification failed"
+        
+        return True, predicted_class, confidence, "Success"
+        
+    except Exception as e:
+        print(f"Error in predict_quality: {str(e)}")
+        return False, "error", 0.0, f"Error during prediction: {str(e)}"
 
 @app.get("/")
 def read_root():
