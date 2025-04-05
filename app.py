@@ -1,16 +1,16 @@
 import numpy as np
-from keras.preprocessing import image
-from keras.models import load_model
+import tensorflow as tf
+import cv2
+import os
 import uvicorn
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
-import cv2
+from typing import List, Optional, Union, Dict
 
 app = FastAPI(title="Eggplant Quality Detection API",
-              description="API for detecting quality of eggplants using Keras model",
+              description="API for detecting quality of eggplants using YOLOv8 model",
               version="1.0.0")
 
 # Add CORS middleware
@@ -23,10 +23,12 @@ app.add_middleware(
 )
 
 # Load model at startup
-model = None
+interpreter = None
 
 # Class names for the model
 quality_class_names = ["good", "semigood", "bad"]
+# Set minimum confidence threshold for detection
+CONFIDENCE_THRESHOLD = 0.1
 
 class PredictionResponse(BaseModel):
     quality: str
@@ -36,23 +38,120 @@ class PredictionResponse(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    global model
+    global interpreter
     try:
         # Load model
-        model = load_model('82accur.h5')
+        interpreter = tf.lite.Interpreter(model_path="Advanced.tflite")
+        interpreter.allocate_tensors()
+        
+        # Print model details
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
         print("Model loaded successfully")
+        print("Input details:", input_details)
+        print("Output details:", output_details)
     except Exception as e:
         print(f"Error loading model: {str(e)}")
 
-def predict_quality(img):
-    global model
+def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale_fill=False, scaleup=True):
+    """Resize image and pad for YOLOv8 input"""
+    shape = img.shape[:2]  # current shape [height, width]
     
-    if model is None:
+    if isinstance(new_shape, int):
+        new_shape = (new_shape, new_shape)
+        
+    # Scale ratio (new / old)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    if not scaleup:  # only scale down, do not scale up (for better val mAP)
+        r = min(r, 1.0)
+        
+    # Compute padding
+    ratio = r, r  # width, height ratios
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
+    
+    if auto:  # minimum rectangle
+        dw, dh = np.mod(dw, 32), np.mod(dh, 32)  # wh padding
+        
+    if scale_fill:  # stretch
+        dw, dh = 0, 0
+        new_unpad = new_shape
+        ratio = new_shape[0] / shape[1], new_shape[1] / shape[0]  # width, height ratios
+        
+    dw /= 2  # divide padding into 2 sides
+    dh /= 2
+    
+    if shape[::-1] != new_unpad:  # resize
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    
+    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+    
+    return img, ratio, (dw, dh)
+
+def process_output(output_data, input_shape, original_shape, confidence_threshold=0.1):
+    """Process YOLOv8 TFLite output and get the highest confidence detection and its class"""
+    try:
+        # Print debug information
+        print("Output data shape:", output_data.shape)
+        
+        # Get the first batch of predictions
+        output = output_data[0]
+        
+        # Print the shape of processed output
+        print("Processed output shape:", output.shape)
+        
+        num_boxes = output.shape[0]
+        max_confidence = 0
+        predicted_class = None
+        has_eggplant = False
+        
+        # Process each detection
+        for i in range(num_boxes):
+            # Get objectness score (confidence that this is an object)
+            confidence = float(output[i][4])
+            print(f"Detection {i} confidence: {confidence}")
+            
+            if confidence > confidence_threshold:
+                # Get class scores (starting from index 5)
+                class_scores = output[i][5:8]  # Only take the first 3 scores for our classes
+                class_id = int(np.argmax(class_scores))
+                class_score = float(class_scores[class_id])
+                
+                # Calculate total confidence
+                total_confidence = confidence * class_score
+                print(f"Detection {i} class_id: {class_id}, class_score: {class_score}, total_confidence: {total_confidence}")
+                
+                # Update if this is the highest confidence detection
+                if total_confidence > max_confidence:
+                    max_confidence = total_confidence
+                    predicted_class = quality_class_names[class_id]
+                    has_eggplant = True
+                    print(f"New best detection: class={predicted_class}, confidence={total_confidence}")
+        
+        print(f"Final result: has_eggplant={has_eggplant}, class={predicted_class}, confidence={max_confidence}")
+        return has_eggplant, predicted_class, max_confidence
+        
+    except Exception as e:
+        print(f"Error in process_output: {str(e)}")
+        return False, None, 0.0
+
+def predict_quality(img):
+    global interpreter
+    
+    if interpreter is None:
         return False, "error", 0.0, "Model not loaded"
     
     try:
-        # Resize image to target size
-        img = cv2.resize(img, (256, 256))
+        # Get model details
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        # Print model details for debugging
+        print("Input details:", input_details)
+        print("Output details:", output_details)
         
         # Convert to RGB if needed
         if len(img.shape) == 3 and img.shape[2] == 3:
@@ -60,18 +159,40 @@ def predict_quality(img):
         else:
             img_rgb = img
         
-        # Convert to array and normalize
-        img_array = image.img_to_array(img_rgb)
-        img_array = np.expand_dims(img_array, axis=0)
-        img_array /= 255.0
+        # Get input shape from model
+        input_shape = input_details[0]['shape'][1:3]
+        print(f"Required input shape: {input_shape}")
         
-        # Make prediction
-        prediction = model.predict(img_array)
-        predicted_class_idx = np.argmax(prediction)
-        confidence = float(prediction[0][predicted_class_idx])
+        # Preprocess image
+        preprocessed_img, ratio, padding = letterbox(img_rgb, input_shape)
+        print(f"Preprocessed image shape: {preprocessed_img.shape}")
         
-        # Get class name
-        predicted_class = quality_class_names[predicted_class_idx]
+        # Normalize to [0, 1]
+        input_data = preprocessed_img.astype(np.float32) / 255.0
+        input_data = np.expand_dims(input_data, axis=0)
+        
+        # Print input stats
+        print(f"Input shape: {input_data.shape}")
+        print(f"Input range: {input_data.min()} to {input_data.max()}")
+        
+        # Run inference
+        interpreter.set_tensor(input_details[0]['index'], input_data)
+        interpreter.invoke()
+        
+        # Get output
+        output_data = interpreter.get_tensor(output_details[0]['index'])
+        print(f"Raw output shape: {output_data.shape}")
+        
+        # Process results
+        has_eggplant, predicted_class, confidence = process_output(
+            output_data, input_shape, img.shape[:2], CONFIDENCE_THRESHOLD
+        )
+        
+        if not has_eggplant:
+            return False, None, 0.0, "No eggplant detected in the image"
+        
+        if predicted_class is None:
+            return True, None, 0.0, "Eggplant detected but quality classification failed"
         
         return True, predicted_class, confidence, "Success"
         
@@ -109,6 +230,14 @@ async def predict_image(file: UploadFile = File(...)):
                 "message": message
             }
         
+        if quality is None:
+            return {
+                "quality": "unknown",
+                "accuracy": 0.0,
+                "has_eggplant": True,
+                "message": message
+            }
+        
         return {
             "quality": quality,
             "accuracy": accuracy,
@@ -127,17 +256,4 @@ async def predict_image(file: UploadFile = File(...)):
 
 # For local development
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
-
-# Previous code (commented out)
-# import numpy as np
-# import tensorflow as tf
-# import cv2
-# import os
-# import uvicorn
-# from fastapi import FastAPI, File, UploadFile
-# from fastapi.responses import JSONResponse
-# from fastapi.middleware.cors import CORSMiddleware
-# from pydantic import BaseModel
-# from typing import List, Optional, Union, Dict
-# ... (rest of the previous code remains commented) 
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True) 
