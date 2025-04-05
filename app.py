@@ -1,27 +1,38 @@
-from flask import Flask, request, jsonify
 import numpy as np
 import tensorflow as tf
 import cv2
 import os
-from werkzeug.utils import secure_filename
+import uvicorn
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import base64
+from typing import Optional
 
-app = Flask(__name__)
+app = FastAPI(title="Eggplant Quality Detection API",
+              description="API for detecting quality of eggplants using YOLOv8 model",
+              version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configure upload folder
 UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
-
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 
-def allowed_file(filename):
+def allowed_file(filename: str) -> bool:
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def process_image(image_path):
+def process_image(image_path: str) -> tuple[Optional[dict], Optional[str]]:
     try:
         # Load the TFLite model
         interpreter = tf.lite.Interpreter(model_path="Advanced.tflite")
@@ -91,7 +102,7 @@ def process_image(image_path):
                 cv2.putText(img, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
             # Save the processed image
-            output_path = os.path.join(app.config['UPLOAD_FOLDER'], 'processed_' + os.path.basename(image_path))
+            output_path = os.path.join(UPLOAD_FOLDER, 'processed_' + os.path.basename(image_path))
             cv2.imwrite(output_path, img)
 
             # Convert image to base64
@@ -114,31 +125,31 @@ def process_image(image_path):
     except Exception as e:
         return None, str(e)
 
-@app.route('/predict', methods=['POST'])
-def predict():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file part'}), 400
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    if not allowed_file(file.filename):
+        raise HTTPException(status_code=400, detail="Invalid file type")
     
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No selected file'}), 400
-    
-    if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+    try:
+        # Save the uploaded file
+        filepath = os.path.join(UPLOAD_FOLDER, file.filename)
+        with open(filepath, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
         
+        # Process the image
         result, error = process_image(filepath)
         
         # Clean up the uploaded file
         os.remove(filepath)
         
         if error:
-            return jsonify({'error': error}), 500
+            raise HTTPException(status_code=500, detail=error)
             
-        return jsonify(result)
+        return result
     
-    return jsonify({'error': 'Invalid file type'}), 400
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000) 
+    uvicorn.run("app:app", host="0.0.0.0", port=5000) 
