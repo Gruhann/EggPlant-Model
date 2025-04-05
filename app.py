@@ -28,7 +28,7 @@ interpreter = None
 # Class names for the model
 quality_class_names = ["good", "semigood", "bad"]
 # Set minimum confidence threshold for detection
-CONFIDENCE_THRESHOLD = 0.3
+CONFIDENCE_THRESHOLD = 0.1
 
 class PredictionResponse(BaseModel):
     quality: str
@@ -43,7 +43,13 @@ async def startup_event():
         # Load model
         interpreter = tf.lite.Interpreter(model_path="Advanced.tflite")
         interpreter.allocate_tensors()
+        
+        # Print model details
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
         print("Model loaded successfully")
+        print("Input details:", input_details)
+        print("Output details:", output_details)
     except Exception as e:
         print(f"Error loading model: {str(e)}")
 
@@ -87,7 +93,7 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
 
 def process_output(output_data, input_shape, original_shape, confidence_threshold=0.3):
     """Process YOLOv8 TFLite output and get the highest confidence detection and its class"""
-    # Reshape the output tensor to match YOLOv8's output format
+    print("Processing output shape:", output_data.shape)
     output = output_data[0]  # First output is typically the detection data
     
     # YOLOv8 output shape is [batch, boxes, 85] 
@@ -95,6 +101,7 @@ def process_output(output_data, input_shape, original_shape, confidence_threshol
     # or in some exported models it's [batch, boxes, 4+1+num_classes]
     
     num_boxes = output.shape[0]
+    print(f"Number of detections: {num_boxes}")
     box_data = []
     max_confidence = 0
     predicted_class = None
@@ -140,12 +147,17 @@ def predict_quality(img):
     input_data = preprocessed_img.astype(np.float32) / 255.0
     input_data = np.expand_dims(input_data, axis=0)
     
+    print("Input shape:", input_data.shape)
+    print("Input value range:", input_data.min(), "to", input_data.max())
+    
     # Set the input tensor and run inference
     interpreter.set_tensor(input_details[0]['index'], input_data)
     interpreter.invoke()
     
     # Get the output tensor
     output_data = interpreter.get_tensor(output_details[0]['index'])
+    print("Model output shape:", output_data.shape)
+    print("First few values:", output_data[0, :5])  # Print first 5 values
     
     # Process results
     original_shape = img.shape[:2]
